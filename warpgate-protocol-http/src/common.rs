@@ -77,6 +77,22 @@ fn session_host_is_authorized(request_host: Option<&str>, base_host: &str) -> bo
         || (is_localhost_host(host) && base_host != "localhost" && base_host != "127.0.0.1")
 }
 
+/// Whether `host` is bound to an HTTP target through its `external_host`
+/// option. An admin explicitly pointed that domain at Warpgate, so it is as
+/// legitimate an origin for a session as the base host - even when it is not
+/// a subdomain of it.
+pub async fn host_is_bound_to_target(
+    ctx: &UnauthenticatedRequestContext,
+    host: &str,
+) -> Result<bool, WarpgateError> {
+    Ok(ctx
+        .services()
+        .config_provider
+        .get_target_by_hostname(host)
+        .await?
+        .is_some())
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct SsoLoginState {
     pub token: WarpgateIdToken,
@@ -453,7 +469,12 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
         };
         if let Some(base_host) = base_host {
             let request_host = ctx.trusted_hostname(&req);
-            if !session_host_is_authorized(request_host.as_deref(), &base_host) {
+            let authorized = session_host_is_authorized(request_host.as_deref(), &base_host)
+                || match request_host.as_deref() {
+                    Some(host) => host_is_bound_to_target(&ctx, host).await?,
+                    None => false,
+                };
+            if !authorized {
                 tracing::warn!(
                     "Session cookie rejected: request host {:?} is not authorized (base host: '{}'). Clearing session.",
                     request_host,

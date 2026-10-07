@@ -4,7 +4,9 @@ use poem::web::Data;
 use poem::{Endpoint, FromRequest, IntoResponse, Middleware, Request, Response};
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 
-use crate::common::{SESSION_COOKIE_NAME, host_is_subdomain_of_or_equal, is_localhost_host};
+use crate::common::{
+    SESSION_COOKIE_NAME, host_is_bound_to_target, host_is_subdomain_of_or_equal, is_localhost_host,
+};
 
 #[derive(Clone)]
 pub struct CookieHostMiddleware {
@@ -48,7 +50,9 @@ impl<E: Endpoint> Endpoint for CookieHostMiddlewareEndpoint<E> {
     type Output = Response;
 
     async fn call(&self, req: Request) -> poem::Result<Self::Output> {
-        let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(&req).await?;
+        let ctx = Data::<&UnauthenticatedRequestContext>::from_request_without_body(&req)
+            .await?
+            .clone();
         let host = ctx.trusted_hostname(&req);
         let is_https = ctx.trusted_proto(&req) == Scheme::HTTPS;
 
@@ -68,8 +72,12 @@ impl<E: Endpoint> Endpoint for CookieHostMiddlewareEndpoint<E> {
         //  • Host == external_host exactly, or Host is a subdomain of it →
         //    set Domain to base_domain so the cookie is accessible from both
         //    external_host *and* all its subdomains.
+        //  • Host is bound to a target via its `external_host` → remove
+        //    Domain (the cookie stays scoped to that host) but still mark it
+        //    Secure/SameSite=None like the base host, so it survives
+        //    cross-site SSO callbacks.
         //  • Any other host → leave the cookie as-is (scoped to that host).
-        let target_domain: Option<Option<String>> = match host.as_deref() {
+        let mut target_domain: Option<Option<String>> = match host.as_deref() {
             None => self
                 .base_domain
                 .as_ref()
@@ -83,6 +91,14 @@ impl<E: Endpoint> Endpoint for CookieHostMiddlewareEndpoint<E> {
                 }
             }),
         };
+
+        if target_domain.is_none()
+            && resp.headers().contains_key(http::header::SET_COOKIE)
+            && let Some(h) = host.as_deref()
+            && host_is_bound_to_target(&ctx, h).await?
+        {
+            target_domain = Some(None);
+        }
 
         let Some(target_domain) = target_domain else {
             return Ok(resp);
@@ -109,7 +125,7 @@ impl<E: Endpoint> Endpoint for CookieHostMiddlewareEndpoint<E> {
                 if let Some(ref domain) = target_domain {
                     cookie.set_domain(domain.clone());
                 } else {
-                    // For localhost/127.0.0.1, omit Domain attribute since browsers won't send cookies with a different domain
+                    // For localhost/127.0.0.1 and target-bound hosts, omit the Domain attribute so the cookie stays scoped to the request host
                     cookie.unset_domain();
                 }
 
